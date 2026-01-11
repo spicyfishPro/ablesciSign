@@ -35,13 +35,34 @@ def protect_privacy(text):
     # 邮箱隐私处理
     if "@" in text:
         parts = text.split("@")
+        
+        # 1. 处理 @ 前面的部分（保持原有逻辑）
         if len(parts[0]) > 2:
             protected_local = parts[0][:2] + "***"
         else:
             protected_local = "***"
-        return f"{protected_local}@{parts[1]}"
+            
+        # 2. 处理 @ 后面的部分（修改处）
+        # 获取域名部分
+        domain = parts[1]
+        
+        # 方式A：完全隐藏域名 (输出示例: te***@***)
+        # protected_domain = "***"
+        
+        # 方式B：隐藏域名主体，保留后缀 (输出示例: te***@***.com) - 推荐，看起来更像邮箱
+        if "." in domain:
+            try:
+                # 分割域名和后缀
+                domain_parts = domain.split(".", 1)
+                protected_domain = "***." + domain_parts[1]
+            except:
+                protected_domain = "***"
+        else:
+            protected_domain = "***"
+            
+        return f"{protected_local}@{protected_domain}"
     
-    # 用户名隐私处理
+    # 用户名隐私处理（保持原有逻辑）
     if len(text) > 2:
         return text[:2] + "***"
     else:
