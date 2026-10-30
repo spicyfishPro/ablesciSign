@@ -11,6 +11,7 @@ permissions:
 jobs:
   sign:
     runs-on: ubuntu-latest
+    timeout-minutes: 10
     steps:
       - name: Checkout code
         uses: actions/checkout@v4
@@ -25,6 +26,9 @@ jobs:
         run: |
           python -m pip install --upgrade pip
           pip install -r requirements.txt
+
+      - name: Run unit tests
+        run: python -m unittest discover -s tests -v
 
       - name: Run AbleSci Sign
         id: sign

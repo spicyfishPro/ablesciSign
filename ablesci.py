@@ -24,6 +24,7 @@ import json
 import datetime
 from pathlib import Path
 from datetime import timezone, timedelta
+from dataclasses import dataclass
 
 
 try:
@@ -37,6 +38,58 @@ ENV_ACCOUNTS = "ABLESCI_ACCOUNTS"
 
 # 邮箱匹配正则（用于识别账号锚点，避免按逗号/分号拆分时误伤密码）
 EMAIL_RE = re.compile(r'[A-Za-z0-9._%+-]+@[A-Za-z0-9.-]+\.[A-Za-z]{2,}')
+
+
+@dataclass(frozen=True)
+class AccountResult:
+    """账号结果只保存脱敏账号，不保存凭据或响应正文。"""
+    account: str
+    status: str  # signed / already_signed / failed
+    reason: str = ""
+
+    @property
+    def ok(self):
+        return self.status in ("signed", "already_signed")
+
+
+FAILURE_LABELS = {
+    "csrf_missing": "无法读取 CSRF 令牌，登录页结构可能已变更",
+    "captcha_required": "需要人工完成图片验证",
+    "captcha_invalid": "图片验证码错误或已失效，需要人工验证",
+    "captcha_unavailable": "图片验证码服务暂时不可用",
+    "rate_limited": "请求受到限流，请稍后重试",
+    "login_failed": "登录失败",
+    "sign_failed": "签到失败",
+    "invalid_response": "服务端响应格式异常",
+    "http_error": "服务端返回异常 HTTP 状态",
+    "timeout": "请求超时",
+    "network_error": "网络请求失败",
+    "unexpected_error": "账号处理发生异常",
+}
+
+
+def response_failure(payload, status_code=200):
+    """与当前登录页 bridge.js 使用相同的验证码标记。"""
+    data = payload.get("data", {}) if isinstance(payload, dict) else {}
+    if not isinstance(data, dict):
+        data = {}
+    error_code = data.get("error_code")
+    if error_code == "CAPTCHA_UNAVAILABLE":
+        return "captcha_unavailable"
+    if error_code == "CAPTCHA_INVALID":
+        return "captcha_invalid"
+    if (error_code == "CAPTCHA_REQUIRED" or data.get("captcha_required")
+            or str(data.get("verify", "")) == "1"):
+        return "captcha_required"
+    if status_code == 429 or error_code == "RATE_LIMITED":
+        return "rate_limited"
+    return ""
+
+
+def already_signed(message):
+    return (isinstance(message, str)
+            and not re.search(r"未签到|未能签到|没有签到|未登录|请.*登录", message)
+            and any(text in message for text in ("已经签到", "已签到", "您今天已于")))
 
 
 def load_env_file():
@@ -61,7 +114,8 @@ def load_env_file():
             line = line.strip()
             if not line or line.startswith('#'):
                 continue
-            if '=' in line:
+            # 无键账号行的密码也可能包含等号，不能将其当作环境变量名输出。
+            if '=' in line and re.fullmatch(r'[A-Za-z_][A-Za-z0-9_]*', line.split('=', 1)[0].strip()):
                 key, value = line.split('=', 1)
                 key = key.strip()
                 value = value.strip()
@@ -99,9 +153,6 @@ def load_env_file():
                 safe_lines.append("***")
         safe = " / ".join(safe_lines)
         print(f"当前 {ENV_ACCOUNTS} 内容预览: {safe}（共 {len(safe_lines)} 个账号，密码已隐藏）")
-
-
-load_env_file()
 
 
 def get_beijing_time():
@@ -204,20 +255,21 @@ class Notifier:
         print(log_message)
         self.log_content.append(log_message)
         
-    def send_notification(self):
+    def send_notification(self, content=None):
         """发送通知"""
         if not self.notify_enabled:
             self.log("通知功能未启用", "warning")
             return False
             
-        content = "\n".join(self.log_content)
+        if content is None:
+            content = "\n".join(self.log_content)
         
         try:
             self.send(self.title, content)
             self.log("通知发送成功", "success")
             return True
         except Exception as e:
-            self.log(f"发送通知失败: {str(e)}", "error")
+            self.log(f"发送通知失败: {type(e).__name__}", "error")
             return False
     
     def get_content(self):
@@ -233,6 +285,7 @@ class AbleSciAuto:
         self.username = None
         self.points = None
         self.sign_days = None
+        self.failure_reason = "login_failed"
         self.notifier = notifier if notifier else Notifier()
         self.headers = {
             "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/138.0.0.0 Safari/537.36",
@@ -246,8 +299,20 @@ class AbleSciAuto:
         self.log(f"处理账号: {protected_email}", "info")
         
     def log(self, message, level="info"):
-        """代理日志到通知系统"""
+        """服务端消息也需脱敏，异常正文和请求凭据不进入日志。"""
+        message = str(message)
+        if self.password:
+            message = message.replace(self.password, "***")
+        message = EMAIL_RE.sub(lambda m: protect_privacy(m.group()), message)
         self.notifier.log(message, level)
+
+    def fail(self, reason, detail=""):
+        self.failure_reason = reason
+        self.log(FAILURE_LABELS[reason] + (f"：{detail}" if detail else ""), "error")
+        return False
+
+    def result(self, status, reason=""):
+        return AccountResult(protect_privacy(self.email), status, reason)
         
     def get_csrf_token(self):
         """获取CSRF令牌
@@ -270,27 +335,28 @@ class AbleSciAuto:
                 if not token:
                     csrf_input = soup.find('input', {'name': '_csrf'})
                     if csrf_input:
-                        token = csrf_input.get('value', '')
+                        token = csrf_input.get('value', '').strip()
                 if token:
                     return token
-                self.log("CSRF令牌元素未找到（meta[csrf-token] 与 input[_csrf] 均缺失，页面结构可能再次变更）", "error")
+                self.fail("csrf_missing")
             else:
-                self.log(f"获取CSRF令牌失败，状态码: {response.status_code}", "error")
-        except Exception as e:
-            self.log(f"获取CSRF令牌时出错: {str(e)}", "error")
+                reason = "rate_limited" if response.status_code == 429 else "http_error"
+                self.fail(reason, f"获取登录页 HTTP {response.status_code}")
+        except requests.Timeout:
+            self.fail("timeout", "获取登录页")
+        except requests.RequestException:
+            self.fail("network_error", "获取登录页")
         return ''
 
     def login(self):
         """执行登录操作"""
         if not self.email or not self.password:
-            self.log("邮箱或密码为空", "error")
-            return False
+            return self.fail("login_failed", "邮箱或密码为空")
             
         login_url = "https://www.ablesci.com/site/login"
         csrf_token = self.get_csrf_token()
         
         if not csrf_token:
-            self.log("无法获取CSRF令牌", "error")
             return False
         
         login_data = {
@@ -312,27 +378,30 @@ class AbleSciAuto:
                 timeout=30
             )
             
-            if response.status_code == 200:
-                try:
-                    result = response.json()
-                    if result.get("code") == 0:
-                        self.log(f"登录成功: {result.get('msg')}", "success")
-                        return True
-                    else:
-                        # 隐私保护：服务端返回的 msg 一般不含密码，但如果将来出现异常内容，这里也不会打出密码
-                        self.log(f"登录失败: {result.get('msg')}", "error")
-                except json.JSONDecodeError:
-                    if "退出" in response.text:
-                        self.log("登录成功", "success")
-                        return True
-                    else:
-                        self.log("登录失败: 无法解析响应", "error")
-            else:
-                self.log(f"登录请求失败，状态码: {response.status_code}", "error")
-        except Exception as e:
-            # 注意：requests 抛出的异常不包含 POST body，因此不会泄露密码
-            self.log(f"登录过程中出错: {str(e)}", "error")
-        return False
+            try:
+                result = response.json()
+            except ValueError:
+                result = None
+            reason = response_failure(result, response.status_code)
+            if reason:
+                return self.fail(reason)
+            if response.status_code != 200:
+                return self.fail("http_error", f"登录 HTTP {response.status_code}")
+            if not isinstance(result, dict):
+                # 兼容旧站点的已登录 HTML，不能仅凭页面中出现“退出”字样判成功。
+                soup = BeautifulSoup(response.text, 'html.parser')
+                if soup.select_one('a[href^="/site/logout"]'):
+                    self.log("登录成功", "success")
+                    return True
+                return self.fail("invalid_response", "登录接口未返回 JSON")
+            if type(result.get("code")) is int and result["code"] == 0:
+                self.log("登录成功", "success")
+                return True
+            return self.fail("login_failed", str(result.get("msg") or "账号验证未通过"))
+        except requests.Timeout:
+            return self.fail("timeout", "登录请求")
+        except requests.RequestException:
+            return self.fail("network_error", "登录请求")
 
     def get_user_info(self):
         """获取用户信息（包括用户名、积分和签到天数）"""
@@ -372,9 +441,9 @@ class AbleSciAuto:
                 
                 return True
             else:
-                self.log(f"获取首页失败，状态码: {response.status_code}", "error")
+                self.log(f"获取用户信息失败，HTTP {response.status_code}", "warning")
         except Exception as e:
-            self.log(f"获取用户信息时出错: {str(e)}", "error")
+            self.log(f"获取用户信息时出错: {type(e).__name__}", "warning")
         return False
 
     def sign_in(self):
@@ -385,37 +454,36 @@ class AbleSciAuto:
         
         try:
             response = self.session.get(sign_url, headers=headers, timeout=30)
-            if response.status_code == 200:
-                try:
-                    result = response.json()
-                    if result.get("code") == 0:
-                        msg = result.get("msg", "").replace("签到成功，", "", 1)
-                        self.log(f"签到成功: {result.get('msg')}", "success")
-                        
-                        data = result.get("data", {})
-                        if data:
-                            if "points" in data:
-                                self.points = data["points"]
-                                self.log(f"更新积分: {self.points}", "info")
-                            if "sign_days" in data:
-                                self.sign_days = data["sign_days"]
-                                self.log(f"更新连续签到天数: {self.sign_days}", "info")
-                        return True
-                    else:
-                        msg = result.get('msg', '')
-                        if "您今天已于" in msg:
-                            msg = result.get("msg", "").replace("签到失败，", "", 1)
-                            self.log(f"今日已签到: {msg}", "info")
-                            return True
-                        else:
-                            self.log(f"签到失败: {msg}", "error")
-                except json.JSONDecodeError:
-                    self.log("签到响应不是有效的JSON", "error")
+            try:
+                result = response.json()
+            except ValueError:
+                result = None
+            reason = response_failure(result, response.status_code)
+            if reason:
+                self.fail(reason)
+            elif response.status_code != 200:
+                self.fail("http_error", f"签到 HTTP {response.status_code}")
+            elif not isinstance(result, dict):
+                self.fail("invalid_response", "签到接口未返回 JSON 对象")
+            elif type(result.get("code")) is not int:
+                self.fail("invalid_response", "签到响应缺少有效状态码")
+            elif already_signed(result.get("msg", "")):
+                self.log(f"今日已签到: {result.get('msg')}", "success")
+                return self.result("already_signed")
+            elif result["code"] == 0:
+                self.log(f"签到成功: {result.get('msg')}", "success")
+                data = result.get("data", {})
+                if isinstance(data, dict):
+                    self.points = data.get("points", self.points)
+                    self.sign_days = data.get("sign_days", self.sign_days)
+                return self.result("signed")
             else:
-                self.log(f"签到请求失败，状态码: {response.status_code}", "error")
-        except Exception as e:
-            self.log(f"签到过程中出错: {str(e)}", "error")
-        return False
+                self.fail("sign_failed", str(result.get("msg") or "服务端未确认签到"))
+        except requests.Timeout:
+            self.fail("timeout", "签到请求")
+        except requests.RequestException:
+            self.fail("network_error", "签到请求")
+        return self.result("failed", self.failure_reason)
 
     def display_summary(self, is_before_sign=False):
         """显示执行摘要"""
@@ -434,20 +502,31 @@ class AbleSciAuto:
         self.log("")
 
     def run(self):
-        """执行完整的登录和签到流程"""
-        if self.login():
-            self.get_user_info()
-            self.display_summary(is_before_sign=True)
-            
-            sign_result = self.sign_in()
-            
-            if sign_result:
-                self.log("签到完成，刷新用户信息...", "info")
+        """只以签到接口响应确定结果，展示信息失败不覆盖已确认的结果。"""
+        try:
+            if not self.login():
+                return self.result("failed", self.failure_reason)
+            self.show_user_info(is_before_sign=True)
+            result = self.sign_in()
+            if result.ok:
                 time.sleep(2)
-                self.get_user_info()
-                self.display_summary(is_before_sign=False)
-        
-        return self.notifier.get_content()
+                self.show_user_info()
+            return result
+        except Exception as e:
+            self.fail("unexpected_error", type(e).__name__)
+            return self.result("failed", self.failure_reason)
+        finally:
+            try:
+                self.session.close()
+            except Exception as e:
+                self.log(f"关闭账号会话失败: {type(e).__name__}", "warning")
+
+    def show_user_info(self, is_before_sign=False):
+        try:
+            if self.get_user_info():
+                self.display_summary(is_before_sign=is_before_sign)
+        except Exception as e:
+            self.log(f"用户信息展示失败: {type(e).__name__}", "warning")
 
 
 def get_accounts():
@@ -507,6 +586,7 @@ def get_accounts():
 
 def main():
     """主函数，处理多账号签到，统一通知器"""
+    load_env_file()
     # 创建全局通知器，所有账号共享
     global_notifier = Notifier("科研通多账号签到")
     global_notifier.log("科研通多账号签到任务开始", "info")
@@ -519,26 +599,45 @@ def main():
         global_notifier.log(f"请设置环境变量 {ENV_ACCOUNTS}，格式为：邮箱1:密码1[换行]邮箱2:密码2", "warning")
         if global_notifier.notify_enabled:
             global_notifier.send_notification()
-        return
+        return 1
     
     global_notifier.log(f"找到 {account_count} 个账号", "info")
     
+    results = []
     for i, (email, password) in enumerate(accounts, 1):
         global_notifier.log(f"\n===== 开始处理第 {i}/{account_count} 个账号 =====", "info")
         
-        automator = AbleSciAuto(email, password, notifier=global_notifier)
-        automator.run()
+        try:
+            automator = AbleSciAuto(email, password, notifier=global_notifier)
+            result = automator.run()
+        except Exception as e:
+            global_notifier.log(f"账号处理异常: {type(e).__name__}", "error")
+            result = AccountResult(protect_privacy(email), "failed", "unexpected_error")
+        results.append(result)
         
         global_notifier.log(f"===== 完成第 {i}/{account_count} 个账号处理 =====", "info")
     
     global_notifier.log("\n===== 所有账号处理完成 =====", "info")
+
+    labels = {"signed": "签到成功", "already_signed": "今日已签到", "failed": "失败"}
+    summary = []
+    for i, result in enumerate(results, 1):
+        line = f"账号 {i} {result.account}：{labels[result.status]}"
+        if result.reason:
+            line += f"（{FAILURE_LABELS[result.reason]}；{result.reason}）"
+        summary.append(line)
+    failed_count = sum(not result.ok for result in results)
+    summary.append(f"汇总：{len(results)} 个账号，{len(results) - failed_count} 个成功或已签到，{failed_count} 个失败")
+    summary_content = "\n".join(summary)
+    global_notifier.log(summary_content, "error" if failed_count else "success")
     
     if global_notifier.notify_enabled:
-        global_notifier.send_notification()
+        global_notifier.send_notification(content=summary_content)
 
     # 已移除 set-output（GitHub 早已弃用，且会把日志再输出一次）。
     # 若需要在 workflow 中使用日志，请改用 $GITHUB_OUTPUT 或写入文件。
+    return 1 if failed_count else 0
 
 
 if __name__ == "__main__":
-    main()
+    sys.exit(main())
